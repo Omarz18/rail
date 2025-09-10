@@ -238,11 +238,12 @@ async def phone_check(raw: str) -> List[str]:
 
             if name_val:
                 try:
-                name_val = json.loads(f'"{name_val}"')
-            except Exception:
-                pass
-            out.append(f"👤 الاسم المحتمل: {name_val}")")
-                return out  # stop on first success
+                    if "\\u" in name_val:
+                        name_val = json.loads(f'"{name_val}"')
+                except Exception:
+                    pass
+                out.append(f"👤 الاسم المحتمل: {name_val}  ({tag}, {used_encoding})")
+                return out
 
             # Diagnostics when no name
             if DEBUG:
@@ -378,10 +379,17 @@ def build_app():
     app.add_handler(conv)
     return app
 
+
+async def on_error(update, context):
+    import traceback
+    tb = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
+    print("ERROR:", tb[:4000])
+
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN env var is required")
     app = build_app()
+    app.add_error_handler(on_error)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
