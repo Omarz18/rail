@@ -193,6 +193,18 @@ def _digits_only(s: str) -> str:
 
 
 
+
+def extract_name_from_text(txt: str):
+    # JSON-like
+    m = re.search(r'"name"\s*:\s*"([^"]+)"', txt, flags=re.I)
+    if m: return m.group(1).strip()
+    # Arabic label
+    m = re.search(r"(?:الاسم|name)\s*[:\-]\s*([^\n\r<]{3,60})", txt, flags=re.I)
+    if m: return m.group(1).strip()
+    # Table
+    m = re.search(r">(الاسم|name)\s*</td>\s*<td>\s*([^<]{3,60})", txt, flags=re.I)
+    if m: return m.group(2).strip()
+    return None
 async def phone_check(raw: str) -> List[str]:
     cc = "SA"
     variants = build_sa_variants(raw)
@@ -387,14 +399,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-def extract_name_from_text(txt: str):
-    # JSON-like
-    m = re.search(r'"name"\s*:\s*"([^"]+)"', txt, flags=re.I)
-    if m: return m.group(1).strip()
-    # Arabic label
-    m = re.search(r"(?:الاسم|name)\s*[:\-]\s*([^\n\r<]{3,60})", txt, flags=re.I)
-    if m: return m.group(1).strip()
-    # Table
-    m = re.search(r">(الاسم|name)\s*</td>\s*<td>\s*([^<]{3,60})", txt, flags=re.I)
-    if m: return m.group(2).strip()
-    return None
