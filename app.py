@@ -366,7 +366,7 @@ def build_app():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         name="whois_menu",
-        persistent=False,
+        persistent=False, per_message=True,
     )
     app.add_handler(conv)
     return app
