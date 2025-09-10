@@ -237,7 +237,11 @@ async def phone_check(raw: str) -> List[str]:
                 if m3: name_val = m3.group(2).strip()
 
             if name_val:
-                out.append(f"👤 الاسم المحتمل: {name_val}  ({tag}, {used_encoding})")
+                try:
+                name_val = json.loads(f'"{name_val}"')
+            except Exception:
+                pass
+            out.append(f"👤 الاسم المحتمل: {name_val}")")
                 return out  # stop on first success
 
             # Diagnostics when no name
