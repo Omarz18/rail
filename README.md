@@ -8,3 +8,7 @@ Menu-driven bot with three checks from your original code:
 ## Deploy
 - Set TELEGRAM_TOKEN.
 - Procfile: worker: python app.py
+
+
+### Debugging phone
+Set `DEBUG_PHONE=1` in Railway Variables to include status/encoding + response sample when no name is found.

@@ -8,6 +8,29 @@ from typing import List, Tuple
 import httpx
 import phonenumbers
 from phonenumbers import PhoneNumberFormat, carrier
+import html as _html
+
+def _best_decode(resp):
+    # prefer server-declared encoding; else try utf-8; else cp1256; else iso-8859-6
+    # return (text, used_encoding)
+    enc_order = []
+    if resp.encoding:
+        enc_order.append(resp.encoding)
+    enc_order += ["utf-8", "cp1256", "windows-1256", "iso-8859-6"]
+    raw = resp.content
+    for enc in enc_order:
+        try:
+            txt = raw.decode(enc, errors="replace")
+            return txt, enc
+        except Exception:
+            continue
+    return resp.text, resp.encoding or "unknown"
+
+def _clean_text(s: str) -> str:
+    s = _html.unescape(s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, CallbackQueryHandler, ContextTypes, filters
 
@@ -134,7 +157,12 @@ async def email_check(email: str) -> List[str]:
     return out
 
 # PHONE endpoint (from original):
-CALLER_ID_URL = "http://caller-id.saedhamdan.com/index.php/UserManagement/search_number?number={phone}&country_code={countr}"
+
+CALLER_ID_URL = "http://caller-id.saedhamdan.com/index.php/UserManagement/search_number?number={number}&country_code={cc}"
+
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D", "", s)
+
 
 async def phone_check(raw: str) -> List[str]:
     num = try_parse_phone(raw, default_region="SA")
@@ -144,28 +172,79 @@ async def phone_check(raw: str) -> List[str]:
     intl = phonenumbers.format_number(num, PhoneNumberFormat.INTERNATIONAL)
     local = phonenumbers.format_number(num, PhoneNumberFormat.NATIONAL)
     carr = carrier.name_for_number(num, "en") or "-"
-    # Call external endpoint
     out = [f"📞 رقم صالح:\nE164: {e164}\nIntl: {intl}\nLocal: {local}\nCarrier: {carr}"]
-    url = CALLER_ID_URL.format(phone=re.sub(r'\\D','', e164), countr=str(num.country_code))
+
+    cc = phonenumbers.region_code_for_number(num) or 'SA'  # e.g., 'SA'
+    nsn = str(num.national_number)  # e.g., 5XXXXXXXX
+    variants = []
+    variants.append(("national_no_zero", nsn.lstrip("0")))        # 5XXXXXXXX
+    variants.append(("national_with_zero", ("0" + nsn) if not nsn.startswith("0") else nsn))  # 05XXXXXXXX
+    variants.append(("e164_digits", re.sub(r"\D","", e164)))     # 9665XXXXXXXX
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; who-bot/1.0)",
+        "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+        "Referer": "http://caller-id.saedhamdan.com/",
+    }
     timeout = httpx.Timeout(12.0, read=12.0, connect=12.0)
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(url)
-            if r.status_code == 200:
-                # Try to extract a name from JSON or HTML
-                txt = r.text
-                m = re.search(r'"name"\\s*:\\s*"([^"]+)"', txt)
-                if m:
-                    out.append(f"👤 الاسم المحتمل: {m.group(1)}")
-                else:
-                    # crude fallback
-                    m2 = re.search(r'>([^<]{3,40})</', txt)
-                    if m2:
-                        out.append(f"👤 نتيجة: {m2.group(1).strip()}")
-            else:
-                out.append(f"ℹ️ Caller-ID: status {r.status_code}")
-    except Exception as e:
-        out.append("⚠️ Caller-ID: خطأ شبكة/منع")
+
+    DEBUG = os.getenv("DEBUG_PHONE", "0") == "1"
+
+    async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        for tag, number_variant in variants:
+            url = CALLER_ID_URL.format(number=number_variant, cc=cc)
+            try:
+                r = await client.get(url)
+            except Exception as e:
+                out.append(f"ℹ️ Caller-ID ({tag}): خطأ شبكة/منع ({type(e).__name__})")
+                continue
+
+            used_encoding = r.encoding or "server-default"
+            txt, used_encoding = _best_decode(r)
+            short = _clean_text(txt[:240])
+
+            # JSON path
+            name_val = None
+            try:
+                j = r.json()
+                if isinstance(j, dict):
+                    for k in ["name", "Name", "callerName", "caller_name", "caller"]:
+                        if isinstance(j.get(k), str) and j[k].strip():
+                            name_val = j[k].strip()
+                            break
+                    if not name_val:
+                        # nested
+                        for v in j.values():
+                            if isinstance(v, dict):
+                                for kk in ["name", "Name", "callerName", "caller_name"]:
+                                    if isinstance(v.get(kk), str) and v[kk].strip():
+                                        name_val = v[kk].strip()
+                                        break
+                            if name_val:
+                                break
+            except Exception:
+                pass
+
+            # HTML path
+            if not name_val:
+                m = re.search(r'"name"\s*:\s*"([^"]+)"', txt, flags=re.I)
+                if m: name_val = m.group(1).strip()
+            if not name_val:
+                m2 = re.search(r"(?:الاسم|name)\s*[:\-]\s*([^\n\r<]{3,60})", txt, flags=re.I)
+                if m2: name_val = m2.group(1).strip()
+            if not name_val:
+                m3 = re.search(r">(الاسم|name)\s*</td>\s*<td>\s*([^<]{3,60})", txt, flags=re.I)
+                if m3: name_val = m3.group(2).strip()
+
+            if name_val:
+                out.append(f"👤 الاسم المحتمل: {name_val}  ({tag}, {used_encoding})")
+                return out  # stop on first success
+
+            # Diagnostics when no name
+            if DEBUG:
+                out.append(f"🧪 {tag}: status={r.status_code}, enc={used_encoding}, sample='{short}'")
+
+        out.append("❌ لم يصلني اسم من الخدمة. قد لا يتوفر اسم، أو أن الصيغة غير المدعومة.")
     return out
 
 # USERNAME sites from Link_all.txt (exact list provided)
