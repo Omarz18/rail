@@ -1,177 +1,304 @@
+
 import os
 import re
-import requests
-from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ConversationHandler,
-    ContextTypes, filters
-)
+import asyncio
+import json
+from typing import List, Tuple
+
+import httpx
+import phonenumbers
+from phonenumbers import PhoneNumberFormat, carrier
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, CallbackQueryHandler, ContextTypes, filters
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ASK_USERNAME = 1
 
-def _livecounts_headers():
-    return {
-        'Host': 'api.livecounts.io',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/111.0',
-        'Accept': '*/*',
-        'Accept-Language': 'ar,en-US;q=0.7,en;q=0.3',
-        'Accept-Encoding': 'gzip, deflate',
-        'Origin': 'https://livecounts.io'
-    }
+CHOOSING, INPUT_EMAIL, INPUT_PHONE, INPUT_USER = range(4)
 
-def _storiesig_headers():
-    return {
-        'Host': 'storiesig.info',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/111.0',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'ar,en-US;q=0.7,en;q=0.3',
-        'Accept-Encoding': 'gzip, deflate',
-        'Referer': 'https://storiesig.info/en/',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-origin',
-        'Te': 'trailers'
-    }
+NEGATIVE_HINTS = [
+    "not found", "doesn't exist", "page not found", "404", "sorry, this page isn't available",
+    "user not found", "couldn’t find", "couldn't find", "no such user", "profile is unavailable"
+]
 
-def fetch_from_livecounts(username: str) -> str:
-    h = _livecounts_headers()
-    parts = []
+def is_email(s: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", s, re.I))
+
+def normalize_username(s: str) -> str:
+    s = s.strip()
+    if s.startswith("@"): s = s[1:]
+    return s
+
+def is_username(s: str) -> bool:
+    s = normalize_username(s)
+    return bool(re.fullmatch(r"[A-Za-z0-9_\.]{3,30}", s))
+
+def try_parse_phone(s: str, default_region: str = "SA"):
+    s = s.strip()
     try:
-        r1 = requests.get(f'https://api.livecounts.io/instagram-live-follower-counter/data/{username}', headers=h, timeout=15)
-        if '"success":true' in r1.text:
-            jd = r1.json()
-            parts += [
-                f"- Name: {jd.get('name')}",
-                f"- Verified: {jd.get('verified')}",
-                f"- Bio: {jd.get('description')}",
-            ]
-            if jd.get('avatar'):
-                parts.append(f"- Profile Pic URL: {jd.get('avatar')}")
-        else:
-            r2 = requests.get(f'https://api.livecounts.io/instagram-live-follower-counter/search/{username}', headers=h, timeout=15)
-            if '"success":true' in r2.text:
-                m = re.findall(r"(.*?),(.*?),(.*?),(.*?)]", str(r2.json().get("userData")))
-                if m:
-                    t = m[0]
-                    name = str(t[2]).replace("'username': '", '').replace("'", "")
-                    verified = str(t[3]).replace("'verified':", '').replace('}', '')
-                    parts.append(f"- Name: {name}")
-                    parts.append(f"- Verified: {verified}")
-                    maybe_pic = str(t[0]).replace("'", '').replace("avatar", '').replace("[{:", '')
-                    if maybe_pic.strip():
-                        parts.append(f"- Profile Pic URL: {maybe_pic}")
-        r3 = requests.get(f'https://api.livecounts.io/instagram-live-follower-counter/stats/{username}', headers=h, timeout=15)
-        if '"success":true' in r3.text:
-            jd3 = r3.json()
-            followers = jd3.get('followerCount')
-            bottom = str(jd3.get("bottomOdos"))
-            m = re.findall(r"(.*?),(.*?)]", bottom)
-            following = posts = None
-            if m:
-                following = str(m[0][0]).replace('[', '')
-                posts = m[0][1]
-            if followers is not None: parts.append(f"- Followers Count: {followers}")
-            if following is not None: parts.append(f"- Following: {following}")
-            if posts is not None:     parts.append(f"- Posts: {posts}")
-    except Exception:
-        pass
-    return "\n".join(parts).strip()
-
-def fetch_from_storiesig(username: str) -> str | None:
-    try:
-        r = requests.get(f'https://storiesig.info/api/ig/profile/{username}', headers=_storiesig_headers(), timeout=15)
-        if username in r.text:
-            res = r.json().get("result", {})
-            return "\n".join([
-                f"- Name: {res.get('full_name')}",
-                f"- Bio: {res.get('biography')}",
-                f"- userID: {res.get('id')}",
-                f"- Private: {res.get('is_private')}",
-                f"- Followers Count: {res.get('edge_followed_by',{}).get('count')}",
-                f"- Following: {res.get('edge_follow',{}).get('count')}",
-                f"- Posts: {res.get('edge_owner_to_timeline_media',{}).get('count')}",
-                f"- Profile Pic URL: {res.get('profile_pic_url')}",
-            ])
+        num = phonenumbers.parse(s, default_region)
+        if phonenumbers.is_valid_number(num):
+            return num
     except Exception:
         return None
     return None
 
-def fetch_from_private_api(username: str) -> str | None:
-    try:
-        r = requests.post(
-            "https://i.instagram.com:443/api/v1/users/lookup/",
-            headers={
-                "Connection": "close", "X-IG-Connection-Type": "WIFI",
-                "mid": "XOSINgABAAG1IDmaral3noOozrK0rrNSbPuSbzHq",
-                "X-IG-Capabilities": "3R4=",
-                "Accept-Language": "ar-sa",
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "User-Agent": "Instagram 99.4.0 vv1ck_TweakPY (TweakPY_vv1ck)",
-                "Accept-Encoding": "gzip, deflate"
-            },
-            data={"signed_body": f"35a2d547d3b6ff400f713948cdffe0b789a903f86117eb6e2f3e573079b2f038.{{\"q\":\"{username}\"}}"},
-            timeout=15
-        )
-        if 'No users found' in r.text or '"spam":true' in r.text:
-            return None
-        jd = r.json()
-        u = jd.get('user', {})
-        lines = [
-            f"- Name: {u.get('full_name')}",
-            f"- userID: {jd.get('user_id')}",
-            f"- Email: {jd.get('obfuscated_email')}",
-            f"- Phone Number: {jd.get('obfuscated_phone')}",
-            f"- Verified: {u.get('is_verified')}",
-            f"- Private: {u.get('is_private')}",
-            f"- Has Valid Phone Number: {jd.get('has_valid_phone')}",
-            f"- Can Email Reset: {jd.get('can_email_reset')}",
-            f"- Can Sms Reset: {jd.get('can_sms_reset')}",
-            f"- Profile Pic URL: {u.get('profile_pic_url')}",
-        ]
-        return "\n".join(lines)
-    except Exception:
-        return None
+# ---- Original services (extracted from the provided Who-is-this.py) ---------
+# EMAIL endpoints (13 known):
+EMAIL_ENDPOINTS = [
+    ("Microsoft (officeapps.live)", "GET", "https://odc.officeapps.live.com/odc/emailhrd/getidp?hm=0&emailAddress={email}"),
+    ("Twitter", "GET", "https://twitter.com/users/email_available?email={email}"),
+    ("TikTok (mobile)", "GET", "https://api16-normal-c-alisg.tiktokv.com/passport/email/send_code/v1/"),
+    ("Instagram (recovery)", "POST", "https://www.instagram.com/accounts/account_recovery_send_ajax/"),
+    ("SoundCloud (reset)", "GET", "https://api-mobile.soundcloud.com/users/passwords/reset?client_id=Fiy8xlRI0xJNNGDLbPmGUjTpPRESPx8C&email={email}"),
+    ("Noon (reset)", "POST", "https://www.noon.com/_svc/customer-v1/auth/reset_password"),
+    ("ACAPS (password)", "POST", "https://www.acaps.org/user/password"),
+    ("Vimeo (forgot)", "POST", "https://vimeo.com/forgot_password"),
+    ("NewsAPI (reset)", "POST", "https://newsapi.org/reset-password"),
+    ("NewsAPI (home)", "GET", "https://newsapi.org"),
+    ("DarkwebID (login)", "GET", "https://secure.darkwebid.com/user/login"),
+    ("Snapchat (accounts)", "GET", "https://accounts.snapchat.com"),
+    ("Snapchat (merlin login)", "POST", "https://accounts.snapchat.com/accounts/merlin/login"),
+]
 
-def instagram_info(username: str) -> str:
-    for fn in (fetch_from_private_api, fetch_from_storiesig, fetch_from_livecounts):
-        res = fn(username)
-        if res: return res
-    return "تعذّر الحصول على معلومات هذا الحساب حالياً."
+async def email_check(email: str) -> List[str]:
+    out = []
+    timeout = httpx.Timeout(12.0, read=12.0, connect=12.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        for site, method, url in EMAIL_ENDPOINTS:
+            try:
+                if "{email}" in url:
+                    url_fmt = url.format(email=email)
+                else:
+                    url_fmt = url
+                if site == "TikTok (mobile)":
+                    # The original endpoint is a mobile API that likely needs many params & device headers.
+                    out.append("⏭️ TikTok: تخطّي (تحتاج mobile params/CSRF)")
+                    continue
+                if method == "GET":
+                    r = await client.get(url_fmt, headers={"User-Agent": "Mozilla/5.0"})
+                else:
+                    # Minimal body depending on endpoint
+                    data = {}
+                    if "instagram.com" in url_fmt:
+                        data = {"email_or_username": email}
+                        headers = {"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}
+                        r = await client.post(url_fmt, data=data, headers=headers)
+                    elif "noon.com" in url_fmt:
+                        data = {"email": email}
+                        r = await client.post(url_fmt, json=data, headers={"Content-Type": "application/json"})
+                    elif "acaps.org" in url_fmt:
+                        data = {"name": email}
+                        r = await client.post(url_fmt, data=data)
+                    elif "vimeo.com" in url_fmt:
+                        data = {"email": email}
+                        r = await client.post(url_fmt, data=data)
+                    elif "newsapi.org/reset-password" in url_fmt:
+                        data = {"email": email}
+                        r = await client.post(url_fmt, data=data)
+                    elif "snapchat.com/accounts/merlin/login" in url_fmt:
+                        out.append("⏭️ Snapchat (merlin): تخطّي (تحتاج جلسة/CSRF)")
+                        continue
+                    else:
+                        r = await client.post(url_fmt, data=data)
+                # Interpret response heuristically
+                status = r.status_code
+                text_l = ""
+                try:
+                    text_l = r.text.lower()[:2000]
+                except Exception:
+                    text_l = ""
+                verdict = None
+                if "officeapps.live" in url_fmt:
+                    # Microsoft returns JSON with 'IfExistsResult'
+                    try:
+                        j = r.json()
+                        # 0 = not existing? 1/2 different providers; consider non-zero as exists
+                        exists = j.get("IfExistsResult", -1) in (1,2)
+                        verdict = "✅ قد يكون البريد مستخدم (Microsoft)" if exists else "❌ غير موجود (Microsoft)"
+                    except Exception:
+                        verdict = f"ℹ️ Microsoft: status {status}"
+                elif "twitter.com/users/email_available" in url_fmt:
+                    try:
+                        j = r.json()
+                        available = j.get("valid", False) and j.get("available", False)
+                        verdict = "❌ غير مستخدم على تويتر" if available else "✅ مستخدم/مرتبط على تويتر"
+                    except Exception:
+                        verdict = f"ℹ️ Twitter: status {status}"
+                else:
+                    # Generic heuristic: 200 with no obvious "not found" might indicate email accepted
+                    negative = any(h in text_l for h in ["invalid email","no account","not found","does not exist","unknown email"])
+                    verdict = "✅ مستلم/محتمل مرتبط" if (status < 400 and not negative) else "❌ غير مؤكد/مرفوض"
+                out.append(f"{site}: {verdict}")
+            except Exception as e:
+                out.append(f"{site}: ⚠️ خطأ الشبكة/الحماية ({type(e).__name__})")
+    return out
+
+# PHONE endpoint (from original):
+CALLER_ID_URL = "http://caller-id.saedhamdan.com/index.php/UserManagement/search_number?number={phone}&country_code={countr}"
+
+async def phone_check(raw: str) -> List[str]:
+    num = try_parse_phone(raw, default_region="SA")
+    if not num:
+        return ["⚠️ رقم غير صالح. أرسل بصيغة +9665xxxxxxxx أو 05xxxxxxxx"]
+    e164 = phonenumbers.format_number(num, PhoneNumberFormat.E164)
+    intl = phonenumbers.format_number(num, PhoneNumberFormat.INTERNATIONAL)
+    local = phonenumbers.format_number(num, PhoneNumberFormat.NATIONAL)
+    carr = carrier.name_for_number(num, "en") or "-"
+    # Call external endpoint
+    out = [f"📞 رقم صالح:\nE164: {e164}\nIntl: {intl}\nLocal: {local}\nCarrier: {carr}"]
+    url = CALLER_ID_URL.format(phone=re.sub(r'\\D','', e164), countr=str(num.country_code))
+    timeout = httpx.Timeout(12.0, read=12.0, connect=12.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url)
+            if r.status_code == 200:
+                # Try to extract a name from JSON or HTML
+                txt = r.text
+                m = re.search(r'"name"\\s*:\\s*"([^"]+)"', txt)
+                if m:
+                    out.append(f"👤 الاسم المحتمل: {m.group(1)}")
+                else:
+                    # crude fallback
+                    m2 = re.search(r'>([^<]{3,40})</', txt)
+                    if m2:
+                        out.append(f"👤 نتيجة: {m2.group(1).strip()}")
+            else:
+                out.append(f"ℹ️ Caller-ID: status {r.status_code}")
+    except Exception as e:
+        out.append("⚠️ Caller-ID: خطأ شبكة/منع")
+    return out
+
+# USERNAME sites from Link_all.txt (exact list provided)
+def load_username_sites() -> List[str]:
+    try:
+        with open("Link_all.txt","r",encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+        return lines
+    except Exception:
+        return []
+
+async def username_check(username: str) -> List[str]:
+    username = normalize_username(username)
+    sites = load_username_sites()
+    out = []
+    timeout = httpx.Timeout(10.0, read=10.0, connect=10.0)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; who-bot/1.0)"}
+    async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        tasks = []
+        for pat in sites:
+            url = pat.format(username)
+            tasks.append(_probe(client, url))
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+    found = [u for u, ok in results if ok]
+    missing = [u for u, ok in results if not ok]
+    if found:
+        out.append("✅ موجود في:")
+        out += [f"• {u}" for u in found]
+    if missing:
+        out.append("\n❌ غير موجود/غير مؤكد في:")
+        # just show domain names for brevity
+        for u in missing:
+            out.append("• " + re.sub(r"^https?://(www\\.)?","",u).split("/")[0])
+    return out if out else ["لم يتم التأكد من أي منصة."]
+
+async def _probe(client: httpx.AsyncClient, url: str) -> Tuple[str, bool]:
+    try:
+        r = await client.get(url)
+        ok = r.status_code < 400
+        text = ""
+        try:
+            text = r.text.lower()[:2000]
+        except Exception:
+            text = ""
+        if any(h in text for h in NEGATIVE_HINTS):
+            ok = False
+        return (url, ok)
+    except Exception:
+        return (url, False)
+
+# ---- Telegram bot flow ------------------------------------------------------
+
+def main_menu():
+    kb = [
+        [InlineKeyboardButton("📧 فحص إيميل", callback_data="email")],
+        [InlineKeyboardButton("📞 فحص رقم", callback_data="phone")],
+        [InlineKeyboardButton("👤 فحص يوزر", callback_data="user")],
+    ]
+    return InlineKeyboardMarkup(kb)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("أهلًا 👋\nاكتب /ig للبحث عن حساب إنستغرام.")
+    await update.message.reply_text("اختر نوع الفحص:", reply_markup=main_menu())
+    return CHOOSING
 
-async def ig_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("أرسل اسم المستخدم في إنستغرام (بدون @).")
-    return ASK_USERNAME
+async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    choice = q.data
+    if choice == "email":
+        await q.edit_message_text("أرسل الإيميل:")
+        return INPUT_EMAIL
+    elif choice == "phone":
+        await q.edit_message_text("أرسل رقم الجوال (+9665xxxxxxxx أو 05xxxxxxxx):")
+        return INPUT_PHONE
+    else:
+        await q.edit_message_text("أرسل اليوزر (مثال: @username):")
+        return INPUT_USER
 
-async def ig_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = (update.message.text or "").strip().lstrip("@")
-    await update.message.reply_text("لحظة... جارِ جلب البيانات 🔎")
-    text = instagram_info(username)
-    if len(text) > 4000:
-        text = text[:4000] + "\n...\n(النتيجة طويلة فتم قصّها)"
-    await update.message.reply_text(text)
-    return ConversationHandler.END
+async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    email = update.message.text.strip()
+    if not is_email(email):
+        await update.message.reply_text("صيغة بريد غير صحيحة. حاول مرة أخرى.")
+        return INPUT_EMAIL
+    await update.message.reply_text("جاري الفحص…")
+    res = await email_check(email)
+    await update.message.reply_text("\n".join(res)[:4000], disable_web_page_preview=True)
+    await update.message.reply_text("انتهى. اختر نوع فحص آخر:", reply_markup=main_menu())
+    return CHOOSING
+
+async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    await update.message.reply_text("جاري الفحص…")
+    res = await phone_check(raw)
+    await update.message.reply_text("\n".join(res)[:4000], disable_web_page_preview=True)
+    await update.message.reply_text("انتهى. اختر نوع فحص آخر:", reply_markup=main_menu())
+    return CHOOSING
+
+async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uname = update.message.text.strip()
+    if not is_username(uname) and not uname.startswith("@"):
+        await update.message.reply_text("صيغة يوزر غير صحيحة. مثال: @example")
+        return INPUT_USER
+    await update.message.reply_text("جاري الفحص… قد يستغرق ثوانٍ.")
+    res = await username_check(uname)
+    await update.message.reply_text("\n".join(res)[:4000], disable_web_page_preview=True)
+    await update.message.reply_text("انتهى. اختر نوع فحص آخر:", reply_markup=main_menu())
+    return CHOOSING
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("تم الإلغاء.")
     return ConversationHandler.END
 
-def main():
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("يرجى ضبط متغير البيئة TELEGRAM_TOKEN")
+def build_app():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     conv = ConversationHandler(
-        entry_points=[CommandHandler("ig", ig_entry)],
-        states={ASK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ig_username)]},
+        entry_points=[CommandHandler("start", start)],
+        states={
+            CHOOSING: [CallbackQueryHandler(on_menu)],
+            INPUT_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email)],
+            INPUT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone)],
+            INPUT_USER:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user)],
+        },
         fallbacks=[CommandHandler("cancel", cancel)],
-        name="ig_conversation",
+        name="whois_menu",
         persistent=False,
     )
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
+    return app
+
+def main():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN env var is required")
+    app = build_app()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
