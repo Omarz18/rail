@@ -31,6 +31,34 @@ def _clean_text(s: str) -> str:
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
+def _digits(s: str) -> str:
+    return re.sub(r"\D", "", s)
+
+def build_sa_variants(text: str):
+    d = _digits(text)
+    if d.startswith("00"):
+        d = d[2:]
+    variants = []
+    if d.startswith("966"):
+        rest = d[3:]
+        if rest:
+            variants.append(rest.lstrip("0"))         # 5XXXXXXXX
+            if not rest.startswith("0"):
+                variants.append("0" + rest)           # 05XXXXXXXX
+        variants.append("966" + (rest or ""))         # 9665XXXXXXXX
+    else:
+        core = d.lstrip("0")
+        if core:
+            variants.append(core)                     # 5XXXXXXXX
+            variants.append("0" + core)               # 05XXXXXXXX
+            variants.append("966" + core)             # 9665XXXXXXXX
+    # dedup while preserving order & plausible lengths
+    seen=set(); out=[]
+    for v in variants:
+        if v and 8 <= len(v) <= 12 and v not in seen:
+            seen.add(v); out.append(v)
+    return out
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, CallbackQueryHandler, ContextTypes, filters
 
@@ -164,77 +192,45 @@ def _digits_only(s: str) -> str:
     return re.sub(r"\D", "", s)
 
 
+
 async def phone_check(raw: str) -> List[str]:
-    num = try_parse_phone(raw, default_region="SA")
-    if not num:
-        return ["⚠️ رقم غير صالح. أرسل بصيغة +9665xxxxxxxx أو 05xxxxxxxx"]
-    e164 = phonenumbers.format_number(num, PhoneNumberFormat.E164)
-    intl = phonenumbers.format_number(num, PhoneNumberFormat.INTERNATIONAL)
-    local = phonenumbers.format_number(num, PhoneNumberFormat.NATIONAL)
-    carr = carrier.name_for_number(num, "en") or "-"
-    out = [f"📞 رقم صالح:\nE164: {e164}\nIntl: {intl}\nLocal: {local}\nCarrier: {carr}"]
-
-    cc = phonenumbers.region_code_for_number(num) or 'SA'  # e.g., 'SA'
-    nsn = str(num.national_number)  # e.g., 5XXXXXXXX
-    variants = []
-    variants.append(("national_no_zero", nsn.lstrip("0")))        # 5XXXXXXXX
-    variants.append(("national_with_zero", ("0" + nsn) if not nsn.startswith("0") else nsn))  # 05XXXXXXXX
-    variants.append(("e164_digits", re.sub(r"\D","", e164)))     # 9665XXXXXXXX
-
+    cc = "SA"
+    variants = build_sa_variants(raw)
+    if not variants:
+        return []
+    timeout = httpx.Timeout(12.0, read=12.0, connect=12.0)
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; who-bot/1.0)",
         "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
         "Referer": "http://caller-id.saedhamdan.com/",
     }
-    timeout = httpx.Timeout(12.0, read=12.0, connect=12.0)
-
-    DEBUG = os.getenv("DEBUG_PHONE", "0") == "1"
-
     async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
-        for tag, number_variant in variants:
-            url = CALLER_ID_URL.format(number=number_variant, cc=cc)
+        for v in variants:
+            url = CALLER_ID_URL.format(number=v, cc=cc)
             try:
                 r = await client.get(url)
             except Exception as e:
-                out.append(f"ℹ️ Caller-ID ({tag}): خطأ شبكة/منع ({type(e).__name__})")
                 continue
-
-            used_encoding = r.encoding or "server-default"
             txt, used_encoding = _best_decode(r)
-            short = _clean_text(txt[:240])
-
             # JSON path
             name_val = None
             try:
                 j = r.json()
                 if isinstance(j, dict):
-                    for k in ["name", "Name", "callerName", "caller_name", "caller"]:
+                    for k in ["name","Name","callerName","caller_name","caller"]:
                         if isinstance(j.get(k), str) and j[k].strip():
-                            name_val = j[k].strip()
-                            break
+                            name_val = j[k].strip(); break
                     if not name_val:
-                        # nested
-                        for v in j.values():
-                            if isinstance(v, dict):
-                                for kk in ["name", "Name", "callerName", "caller_name"]:
-                                    if isinstance(v.get(kk), str) and v[kk].strip():
-                                        name_val = v[kk].strip()
-                                        break
-                            if name_val:
-                                break
+                        for vv in j.values():
+                            if isinstance(vv, dict):
+                                for kk in ["name","Name","callerName","caller_name"]:
+                                    if isinstance(vv.get(kk), str) and vv[kk].strip():
+                                        name_val = vv[kk].strip(); break
+                            if name_val: break
             except Exception:
                 pass
-
-            # HTML path
             if not name_val:
-                m = re.search(r'"name"\s*:\s*"([^"]+)"', txt, flags=re.I)
-                if m: name_val = m.group(1).strip()
-            if not name_val:
-                m2 = re.search(r"(?:الاسم|name)\s*[:\-]\s*([^\n\r<]{3,60})", txt, flags=re.I)
-                if m2: name_val = m2.group(1).strip()
-            if not name_val:
-                m3 = re.search(r">(الاسم|name)\s*</td>\s*<td>\s*([^<]{3,60})", txt, flags=re.I)
-                if m3: name_val = m3.group(2).strip()
+                name_val = extract_name_from_text(txt)
 
             if name_val:
                 try:
@@ -242,17 +238,11 @@ async def phone_check(raw: str) -> List[str]:
                         name_val = json.loads(f'"{name_val}"')
                 except Exception:
                     pass
-                out.append(f"👤 الاسم المحتمل: {name_val}  ({tag}, {used_encoding})")
-                return out
+                return [name_val]
+    return []
 
-            # Diagnostics when no name
-            if DEBUG:
-                out.append(f"🧪 {tag}: status={r.status_code}, enc={used_encoding}, sample='{short}'")
 
-        out.append("❌ لم يصلني اسم من الخدمة. قد لا يتوفر اسم، أو أن الصيغة غير المدعومة.")
-    return out
-
-# USERNAME sites from Link_all.txt (exact list provided)
+            # USERNAME sites from Link_all.txt (exact list provided)
 def load_username_sites() -> List[str]:
     try:
         with open("Link_all.txt","r",encoding="utf-8") as f:
@@ -339,13 +329,15 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("انتهى. اختر نوع فحص آخر:", reply_markup=main_menu())
     return CHOOSING
 
+
 async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
-    await update.message.reply_text("جاري الفحص…")
     res = await phone_check(raw)
-    await update.message.reply_text("\n".join(res)[:4000], disable_web_page_preview=True)
+    name_line = res[0] if res else ""
+    await update.message.reply_text(name_line if name_line else "—")
     await update.message.reply_text("انتهى. اختر نوع فحص آخر:", reply_markup=main_menu())
     return CHOOSING
+
 
 async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uname = update.message.text.strip()
@@ -394,3 +386,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def extract_name_from_text(txt: str):
+    # JSON-like
+    m = re.search(r'"name"\s*:\s*"([^"]+)"', txt, flags=re.I)
+    if m: return m.group(1).strip()
+    # Arabic label
+    m = re.search(r"(?:الاسم|name)\s*[:\-]\s*([^\n\r<]{3,60})", txt, flags=re.I)
+    if m: return m.group(1).strip()
+    # Table
+    m = re.search(r">(الاسم|name)\s*</td>\s*<td>\s*([^<]{3,60})", txt, flags=re.I)
+    if m: return m.group(2).strip()
+    return None
